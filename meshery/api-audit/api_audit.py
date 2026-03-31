@@ -2,24 +2,25 @@
 """
 Meshery API Schema Audit
 
-Compares three data sources within the meshery/meshery repo:
+Compares data sources within meshery/meshery and meshery/schemas to produce
+a comprehensive audit of every API endpoint:
+
   1. server/router/server.go    → registered API endpoints
-  2. docs/data/openapi.yml      → schema-codified check (excludes cloud-only)
+  2. docs/data/openapi.yml      → schema-backed check (from meshery/schemas)
   3. server/handlers/*.go       → schema-driven check (import analysis)
 
-Writes results to a Google Sheet. Credentials are loaded from environment
-variables — never hardcoded.
+For each endpoint the script computes:
+  - Coverage      — Overlap / Server Underlap / Schema Underlap
+  - Status        — Active / Deprecated / Unimplemented / Cloud-only
+  - Schema-Backed — Is the endpoint defined in the OpenAPI spec?
+  - Schema Completeness — Full / Partial / Stub / N/A
+  - Schema-Driven — Does the handler import+use meshery/schemas types?
 
-If a local .env file is present, it is loaded automatically.
+Writes results to a Google Sheet. Credentials come from environment variables.
 
 Usage:
-  # Local (from meshery repo root)
   python api_audit.py --repo .
-
-  # CI
   python api_audit.py --repo . --sheet-id $SHEET_ID
-
-  # Preview without writing
   python api_audit.py --repo /path/to/meshery --dry-run
 """
 
@@ -92,9 +93,11 @@ SHEET_COLUMNS = [
     "Sub-Category",
     "Endpoints",
     "Methods",
-    "API Endpoint is codifed within a schema defined in meshery/schemas.",
-    "Schema-driven in Meshery Server (Models are imported into Meshery Server "
-    "from meshery/schemas and used; they are not locally defined in repo)",
+    "Coverage",
+    "Status",
+    "Schema-Backed",
+    "Schema Completeness",
+    "Schema-Driven",
     "Notes",
     "Change Log",
 ]
@@ -102,14 +105,20 @@ COL_CATEGORY = 0
 COL_SUBCATEGORY = 1
 COL_ENDPOINTS = 2
 COL_METHODS = 3
-COL_CODIFIED = 4
-COL_DRIVEN = 5
-COL_NOTES = 6
-COL_CHANGELOG = 7
+COL_COVERAGE = 4
+COL_STATUS = 5
+COL_BACKED = 6
+COL_COMPLETENESS = 7
+COL_DRIVEN = 8
+COL_NOTES = 9
+COL_CHANGELOG = 10
 
 WORKSHEET_NAME = "Verification of Meshery Server API Endpoints"
 
 HTTP_METHODS = frozenset({"get", "post", "put", "delete", "patch", "options", "head"})
+
+# Methods that typically carry a request body
+BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
 
 MIDDLEWARE_NAMES = frozenset({
     "ProviderMiddleware", "AuthMiddleware", "SessionInjectorMiddleware",
@@ -314,27 +323,114 @@ def _extract_handler(line: str) -> str:
 # 2. OpenAPI parser — docs/data/openapi.yml
 # ---------------------------------------------------------------------------
 
-def parse_openapi(repo: Path) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
-    """Parse openapi.yml and return two lookups:
+def _has_meaningful_schema(schema: Optional[dict]) -> bool:
+    """Check if a schema object has real structure beyond a bare type."""
+    if not schema or not isinstance(schema, dict):
+        return False
+    if "$ref" in schema:
+        return True
+    if any(k in schema for k in ("allOf", "oneOf", "anyOf")):
+        return True
+    if schema.get("type") == "array" and "items" in schema:
+        return True
+    if schema.get("type") == "object" and "properties" in schema:
+        return True
+    return False
 
-    1. all_paths:    {normalized_path: {METHOD}} — every path in the spec.
-                     Used for schema-codified check (does a schema *exist*?).
-    2. server_paths:  {normalized_path: {METHOD}} — excluding x-internal: cloud.
-                     Used for informational notes only.
 
-    Schema-codified answers "is it defined in meshery/schemas?" — yes even if
-    the spec marks it cloud-only, because the schema definition still exists.
+def _get_content_schema(content: Any) -> Optional[dict]:
+    """Extract schema from a content map (application/json, etc.)."""
+    if not isinstance(content, dict):
+        return None
+    for _media_type, media_obj in content.items():
+        if isinstance(media_obj, dict) and "schema" in media_obj:
+            return media_obj["schema"]
+    return None
+
+
+def _assess_completeness(operation: dict, method: str) -> Tuple[str, List[str]]:
+    """Assess schema completeness for a single OpenAPI operation.
+
+    Returns (completeness, detail_notes).
+    """
+    notes: List[str] = []
+    expects_body = method.upper() in BODY_METHODS
+
+    # --- Request side ---
+    request_meaningful = False
+    req_body = operation.get("requestBody", {})
+    if isinstance(req_body, dict):
+        if "$ref" in req_body:
+            request_meaningful = True
+        else:
+            req_schema = _get_content_schema(req_body.get("content", {}))
+            request_meaningful = _has_meaningful_schema(req_schema)
+
+    # --- Response side ---
+    response_meaningful = False
+    responses = operation.get("responses", {})
+    if isinstance(responses, dict):
+        for code, resp in responses.items():
+            if not str(code).startswith("2") or not isinstance(resp, dict):
+                continue
+            if "$ref" in resp:
+                response_meaningful = True
+                break
+            resp_schema = _get_content_schema(resp.get("content", {}))
+            if _has_meaningful_schema(resp_schema):
+                response_meaningful = True
+                break
+
+    # --- Classify ---
+    if expects_body:
+        if request_meaningful and response_meaningful:
+            return "Full", notes
+        if request_meaningful or response_meaningful:
+            if not request_meaningful:
+                notes.append("spec missing requestBody schema")
+            if not response_meaningful:
+                notes.append("spec missing response schema")
+            return "Partial", notes
+        notes.append("spec entry has no request/response schemas")
+        return "Stub", notes
+    else:
+        # GET, DELETE, HEAD, OPTIONS — only response matters
+        if response_meaningful:
+            return "Full", notes
+        notes.append("spec entry has no response schema")
+        return "Stub", notes
+
+
+def parse_openapi(repo: Path) -> dict:
+    """Parse openapi.yml and return structured data for all columns.
+
+    Returns a dict with:
+      all_paths:      {norm_path: {METHOD, ...}}
+      completeness:   {(norm_path, METHOD): "Full"/"Partial"/"Stub"}
+      x_internal:     {(norm_path, METHOD): ["cloud"] or []}
+      original_paths: {norm_path: original_path}
+      compl_notes:    {(norm_path, METHOD): [detail_notes]}
     """
     spec_file = repo / OPENAPI_FILE
+    empty = {
+        "all_paths": {},
+        "completeness": {},
+        "x_internal": {},
+        "original_paths": {},
+        "compl_notes": {},
+    }
     if not spec_file.exists():
         print(f"ERROR: {spec_file} not found", file=sys.stderr)
-        return {}, {}
+        return empty
 
     with open(spec_file, encoding="utf-8") as f:
         doc = yaml.safe_load(f)
 
     all_paths: Dict[str, Set[str]] = {}
-    server_paths: Dict[str, Set[str]] = {}
+    completeness: Dict[Tuple[str, str], str] = {}
+    x_internal: Dict[Tuple[str, str], List[str]] = {}
+    original_paths: Dict[str, str] = {}
+    compl_notes: Dict[Tuple[str, str], List[str]] = {}
 
     for path, methods_obj in doc.get("paths", {}).items():
         if not isinstance(methods_obj, dict):
@@ -344,14 +440,33 @@ def parse_openapi(repo: Path) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]
                 continue
             if not isinstance(details, dict):
                 continue
+
             norm = normalize_path(path)
-            all_paths.setdefault(norm, set()).add(method.upper())
+            m_upper = method.upper()
+            all_paths.setdefault(norm, set()).add(m_upper)
 
-            x_internal = details.get("x-internal", [])
-            if "cloud" not in x_internal:
-                server_paths.setdefault(norm, set()).add(method.upper())
+            # Track original path for spec-only endpoints
+            if norm not in original_paths:
+                original_paths[norm] = path
 
-    return all_paths, server_paths
+            # x-internal tag
+            xi = details.get("x-internal", [])
+            if not isinstance(xi, list):
+                xi = [xi] if xi else []
+            x_internal[(norm, m_upper)] = xi
+
+            # Schema completeness
+            comp, cnotes = _assess_completeness(details, method)
+            completeness[(norm, m_upper)] = comp
+            compl_notes[(norm, m_upper)] = cnotes
+
+    return {
+        "all_paths": all_paths,
+        "completeness": completeness,
+        "x_internal": x_internal,
+        "original_paths": original_paths,
+        "compl_notes": compl_notes,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -513,19 +628,69 @@ def build_schema_driven_map(repo: Path) -> Dict[str, Tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# Classification
+# 4. Classification — bidirectional walk (Router ∪ Spec)
 # ---------------------------------------------------------------------------
+
+def _aggregate_completeness(
+    norm: str,
+    methods: List[str],
+    spec_data: dict,
+) -> Tuple[str, List[str]]:
+    """Aggregate completeness across methods for a single endpoint."""
+    comp_map = spec_data["completeness"]
+    cnotes_map = spec_data["compl_notes"]
+    all_paths = spec_data["all_paths"]
+    spec_methods = all_paths.get(norm, set())
+
+    if not spec_methods:
+        return "N/A", []
+
+    method_comps = []
+    agg_notes: List[str] = []
+    check_methods = spec_methods if methods == ["ALL"] else [
+        m for m in methods if m in spec_methods
+    ]
+
+    for m in check_methods:
+        c = comp_map.get((norm, m), "Stub")
+        method_comps.append(c)
+        agg_notes.extend(cnotes_map.get((norm, m), []))
+
+    if not method_comps:
+        return "Stub", ["spec path exists but no method match"]
+
+    # Deduplicate notes
+    seen: Set[str] = set()
+    unique_notes = []
+    for n in agg_notes:
+        if n not in seen:
+            seen.add(n)
+            unique_notes.append(n)
+
+    if all(c == "Full" for c in method_comps):
+        return "Full", unique_notes
+    if any(c == "Full" for c in method_comps) or any(c == "Partial" for c in method_comps):
+        return "Partial", unique_notes
+    return "Stub", unique_notes
+
 
 def classify_endpoints(
     routes: List[Dict[str, Any]],
-    all_paths: Dict[str, Set[str]],
-    server_paths: Dict[str, Set[str]],
+    spec_data: dict,
     schema_map: Dict[str, Tuple[str, str]],
 ) -> List[Dict[str, Any]]:
-    """Classify each route as schema-codified and schema-driven."""
-    endpoints: List[Dict[str, Any]] = []
-    grouped_routes: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    """Classify endpoints from both router and spec (bidirectional walk)."""
+    all_paths = spec_data["all_paths"]
+    x_internal_map = spec_data["x_internal"]
+    original_paths = spec_data["original_paths"]
 
+    endpoints: List[Dict[str, Any]] = []
+    router_norm_paths: Set[str] = set()
+
+    # ------------------------------------------------------------------
+    # Pass 1: Router-sourced endpoints
+    # ------------------------------------------------------------------
+    grouped_routes: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
     for route in routes:
         methods_str = ", ".join(route["methods"])
         grouped_routes[(route["path"], methods_str)].append(route)
@@ -538,52 +703,126 @@ def classify_endpoints(
 
         category, subcategory = categorize(path)
         norm = normalize_path(path)
+        router_norm_paths.add(norm)
 
-        # Schema-codified: prefer server-applicable schema definitions.
-        # Cloud-only schema coverage counts as Partial rather than TRUE.
         spec_methods = all_paths.get(norm, set())
-        server_methods = server_paths.get(norm, set())
-        if methods == ["ALL"]:
-            if not spec_methods:
-                codified = "FALSE"
-            elif server_methods:
-                codified = "TRUE"
-            else:
-                codified = "Partial"
-        else:
-            matched_all = [m for m in methods if m in spec_methods]
-            matched_server = [m for m in methods if m in server_methods]
-            if len(matched_server) == len(methods) and matched_server:
-                codified = "TRUE"
-            elif matched_all:
-                codified = "Partial"
-            else:
-                codified = "FALSE"
 
-        # Schema-driven: handler imports schema types?
+        # --- Coverage ---
+        coverage = "Overlap" if spec_methods else "Server Underlap"
+
+        # --- Status ---
+        status = "Deprecated" if is_commented else "Active"
+
+        # --- Schema-Backed ---
+        backed = "TRUE" if spec_methods else "FALSE"
+
+        # --- Schema Completeness ---
+        completeness, compl_notes = _aggregate_completeness(norm, methods, spec_data)
+
+        # --- Schema-Driven ---
         handler = route["handler"]
         if handler in ("<inline>", "<unknown>"):
-            driven, reason = "FALSE", f"handler: {handler}"
+            driven, driven_reason = "FALSE", f"handler: {handler}"
         else:
-            driven, reason = schema_map.get(handler, ("FALSE", "handler not mapped"))
+            driven, driven_reason = schema_map.get(
+                handler, ("FALSE", "handler not mapped")
+            )
 
-        # Notes
+        # --- Notes ---
         notes: List[str] = []
         if is_commented:
-            notes.append("commented out / legacy")
-        if not spec_methods:
+            notes.append("commented out in server.go")
+        if coverage == "Server Underlap":
             notes.append("no path in OpenAPI spec")
-        elif norm not in server_paths:
-            notes.append("schema exists but marked cloud-only")
-        if reason:
-            notes.append(reason)
+        else:
+            # Check if any matched method is cloud-only
+            cloud_methods = []
+            for m in (spec_methods if methods == ["ALL"] else methods):
+                xi = x_internal_map.get((norm, m), [])
+                if "cloud" in xi:
+                    cloud_methods.append(m)
+            if cloud_methods and len(cloud_methods) == len(spec_methods):
+                notes.append("spec marked cloud-only (x-internal)")
+        if compl_notes:
+            notes.extend(compl_notes)
+        if driven_reason:
+            notes.append(driven_reason)
 
         endpoints.append({
             "category": category,
             "subcategory": subcategory,
             "path": path,
             "methods": methods_str,
-            "codified": codified,
+            "coverage": coverage,
+            "status": status,
+            "backed": backed,
+            "completeness": completeness,
+            "driven": driven,
+            "notes": "; ".join(notes),
+        })
+
+    # ------------------------------------------------------------------
+    # Pass 2: Spec-only endpoints (Schema Underlap)
+    # ------------------------------------------------------------------
+    for norm_path, spec_methods in sorted(all_paths.items()):
+        if norm_path in router_norm_paths:
+            continue
+
+        original = original_paths.get(norm_path, norm_path)
+        methods_sorted = sorted(spec_methods)
+        category, subcategory = categorize(original)
+
+        # Determine x-internal across all methods for this path
+        all_cloud = True
+        any_cloud = False
+        for m in methods_sorted:
+            xi = x_internal_map.get((norm_path, m), [])
+            if "cloud" in xi:
+                any_cloud = True
+            else:
+                all_cloud = False
+
+        # --- Coverage ---
+        coverage = "Schema Underlap"
+
+        # --- Status ---
+        if all_cloud:
+            status = "Cloud-only"
+        else:
+            status = "Unimplemented"
+
+        # --- Schema-Backed ---
+        backed = "TRUE"
+
+        # --- Schema Completeness ---
+        completeness, compl_notes = _aggregate_completeness(
+            norm_path, methods_sorted, spec_data
+        )
+
+        # --- Schema-Driven ---
+        driven = "N/A"
+
+        # --- Notes ---
+        notes: List[str] = []
+        if status == "Cloud-only":
+            notes.append("defined in spec; cloud-only (x-internal)")
+        elif any_cloud:
+            notes.append("defined in spec; partially cloud-only (x-internal)")
+        else:
+            notes.append("defined in spec; no server route")
+        if compl_notes:
+            notes.extend(compl_notes)
+        notes.append("no handler (schema-only endpoint)")
+
+        endpoints.append({
+            "category": category,
+            "subcategory": subcategory,
+            "path": original,
+            "methods": ", ".join(methods_sorted),
+            "coverage": coverage,
+            "status": status,
+            "backed": backed,
+            "completeness": completeness,
             "driven": driven,
             "notes": "; ".join(notes),
         })
@@ -626,6 +865,29 @@ def _get_sheet_client():
     return None
 
 
+def _col_letter(idx: int) -> str:
+    """Convert 0-based column index to sheet column letter (A, B, ... Z, AA, ...)."""
+    result = ""
+    while True:
+        result = chr(65 + idx % 26) + result
+        idx = idx // 26 - 1
+        if idx < 0:
+            break
+    return result
+
+
+# Columns the script compares and updates on matched rows.
+# (column_index, endpoint_dict_key, human_label)
+_UPDATABLE_COLUMNS = [
+    (COL_COVERAGE, "coverage", "coverage"),
+    (COL_STATUS, "status", "status"),
+    (COL_BACKED, "backed", "backed"),
+    (COL_COMPLETENESS, "completeness", "completeness"),
+    (COL_DRIVEN, "driven", "driven"),
+    (COL_NOTES, "notes", "notes"),
+]
+
+
 def update_sheet(
     endpoints: List[Dict[str, Any]],
     sheet_id: str,
@@ -634,7 +896,8 @@ def update_sheet(
     """Diff computed endpoints against the sheet and apply updates.
 
     - Matches rows by normalized endpoint path + method overlap.
-    - Updates columns E (codified), F (driven), and G (notes) when they differ.
+    - Updates Coverage, Status, Schema-Backed, Schema Completeness,
+      Schema-Driven, and Notes columns when they differ.
     - Inserts new rows into matching category groups when possible.
     - Stamps the Change Log column on modified rows.
     """
@@ -649,10 +912,6 @@ def update_sheet(
         sys.exit(1)
 
     sheet = gc.open_by_key(sheet_id)
-    # try:
-    #     ws = sheet.worksheet(WORKSHEET_NAME)
-    # except Exception:
-    #     ws = sheet.get_worksheet(4)
     ws = sheet.get_worksheet(4)
 
     print(f"Connected to worksheet: {ws.title}")
@@ -693,7 +952,6 @@ def update_sheet(
         for idx, sheet_mset in candidates:
             if idx in matched_rows:
                 continue
-            # Match if: method overlap, either side is ALL, or either is empty
             if (
                 "ALL" in ep_mset
                 or "ALL" in sheet_mset
@@ -705,74 +963,52 @@ def update_sheet(
                 break
 
         if matched_idx is not None:
-            # Update existing row if values differ
             matched_rows.add(matched_idx)
             row = current_rows[matched_idx]
             while len(row) < len(SHEET_COLUMNS):
                 row.append("")
 
             row_changed = False
-
-            old_cod = row[COL_CODIFIED].strip()
-            if old_cod != ep["codified"]:
-                col_letter = chr(65 + COL_CODIFIED)
-                changes.append(
-                    f"UPDATE row {matched_idx + 1} [{ep['path']}] "
-                    f"codified: '{old_cod}' -> '{ep['codified']}'"
-                )
-                batch_updates.append({
-                    "range": f"{col_letter}{matched_idx + 1}",
-                    "values": [[ep["codified"]]],
-                })
-                row_changed = True
-
-            old_drv = row[COL_DRIVEN].strip()
-            if old_drv != ep["driven"]:
-                col_letter = chr(65 + COL_DRIVEN)
-                changes.append(
-                    f"UPDATE row {matched_idx + 1} [{ep['path']}] "
-                    f"driven: '{old_drv}' -> '{ep['driven']}'"
-                )
-                batch_updates.append({
-                    "range": f"{col_letter}{matched_idx + 1}",
-                    "values": [[ep["driven"]]],
-                })
-                row_changed = True
-
-            old_notes = row[COL_NOTES].strip()
-            if old_notes != ep["notes"]:
-                col_letter = chr(65 + COL_NOTES)
-                changes.append(
-                    f"UPDATE row {matched_idx + 1} [{ep['path']}] "
-                    f"notes: '{old_notes}' -> '{ep['notes']}'"
-                )
-                batch_updates.append({
-                    "range": f"{col_letter}{matched_idx + 1}",
-                    "values": [[ep["notes"]]],
-                })
-                row_changed = True
+            for col_idx, field, label in _UPDATABLE_COLUMNS:
+                old_val = row[col_idx].strip() if len(row) > col_idx else ""
+                new_val = ep[field]
+                if old_val != new_val:
+                    cl = _col_letter(col_idx)
+                    changes.append(
+                        f"UPDATE row {matched_idx + 1} [{ep['path']}] "
+                        f"{label}: '{old_val}' -> '{new_val}'"
+                    )
+                    batch_updates.append({
+                        "range": f"{cl}{matched_idx + 1}",
+                        "values": [[new_val]],
+                    })
+                    row_changed = True
 
             if row_changed:
-                col_letter = chr(65 + COL_CHANGELOG)
+                cl = _col_letter(COL_CHANGELOG)
                 batch_updates.append({
-                    "range": f"{col_letter}{matched_idx + 1}",
+                    "range": f"{cl}{matched_idx + 1}",
                     "values": [[today]],
                 })
         else:
-            # New endpoint — insert into matching category group if possible
             new_row = [
                 ep["category"],
                 ep["subcategory"],
                 ep["path"],
                 ep["methods"],
-                ep["codified"],
+                ep["coverage"],
+                ep["status"],
+                ep["backed"],
+                ep["completeness"],
                 ep["driven"],
                 ep["notes"],
                 today,
             ]
             changes.append(
                 f"NEW ROW: {ep['path']} [{ep['methods']}] "
-                f"codified={ep['codified']} driven={ep['driven']}"
+                f"coverage={ep['coverage']} status={ep['status']} "
+                f"backed={ep['backed']} completeness={ep['completeness']} "
+                f"driven={ep['driven']}"
             )
             new_rows_info.append((new_row, ep["category"], ep["subcategory"]))
 
@@ -785,7 +1021,7 @@ def update_sheet(
         })
     )
 
-    # Batch-apply cell updates
+    # --- Apply batch cell updates ---
     if not dry_run and batch_updates:
         try:
             ws.batch_update(batch_updates, value_input_option="RAW")
@@ -793,6 +1029,7 @@ def update_sheet(
         except Exception as exc:
             changes.append(f"BATCH UPDATE ERROR: {exc}")
 
+    # --- Insert new rows ---
     if not dry_run and new_rows_info:
         _insert_rows_by_group(ws, new_rows_info, changes)
 
@@ -804,13 +1041,18 @@ def _insert_rows_by_group(
     new_rows_info: List[Tuple[List[str], str, str]],
     changes: List[str],
 ) -> None:
-    """Insert rows into an existing category/sub-category block when possible."""
+    """Insert new rows into the correct category/sub-category block.
+
+    Groups insertions by target position and processes from bottom to top
+    so that earlier inserts don't shift indices for later ones.
+    """
     try:
         all_rows = ws.get_all_values()
     except Exception as exc:
         changes.append(f"INSERT ERROR (read failed): {exc}")
         return
 
+    # Build index: last row for each (category, subcategory) and category
     group_last_row: Dict[Tuple[str, str], int] = {}
     cat_last_row: Dict[str, int] = {}
     last_cat = ""
@@ -837,21 +1079,25 @@ def _insert_rows_by_group(
             group_last_row[(cat, sub)] = idx
             cat_last_row[cat] = idx
 
+    # Classify each new row: targeted insert or append
     inserts: List[Tuple[int, List[str]]] = []
     append_rows: List[List[str]] = []
 
     for row_data, cat, sub in new_rows_info:
-        insert_after = group_last_row.get((cat, sub))
-        if insert_after is None:
-            insert_after = cat_last_row.get(cat)
+        target = group_last_row.get((cat, sub))
+        if target is None:
+            target = cat_last_row.get(cat)
 
-        if insert_after is not None:
-            inserts.append((insert_after, row_data))
-            group_last_row[(cat, sub)] = insert_after + 1
-            cat_last_row[cat] = insert_after + 1
+        if target is not None:
+            inserts.append((target, row_data))
+            # Advance the group pointer so subsequent rows in the same
+            # group land after this one rather than on top of it.
+            group_last_row[(cat, sub)] = target + 1
+            cat_last_row[cat] = target + 1
         else:
             append_rows.append(row_data)
 
+    # Insert from bottom to top to preserve indices
     inserts.sort(key=lambda item: item[0], reverse=True)
 
     for insert_after, row_data in inserts:
@@ -874,8 +1120,8 @@ def _insert_rows_by_group(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Audit Meshery API endpoints for schema-codified and "
-            "schema-driven status. Writes results to Google Sheet."
+            "Audit Meshery API endpoints for schema coverage, completeness, "
+            "and schema-driven status. Writes results to Google Sheet."
         )
     )
     parser.add_argument(
@@ -919,8 +1165,9 @@ def main():
     print(f"  {len(routes)} route registrations")
 
     print("Parsing OpenAPI spec...")
-    all_paths, server_paths = parse_openapi(repo)
-    print(f"  {len(all_paths)} total spec paths, {len(server_paths)} server-applicable")
+    spec_data = parse_openapi(repo)
+    n_spec = len(spec_data["all_paths"])
+    print(f"  {n_spec} spec paths")
 
     print("Scanning handler imports...")
     schema_map = build_schema_driven_map(repo)
@@ -929,23 +1176,47 @@ def main():
     print(f"  {len(schema_map)} handlers ({n_true} schema-driven, {n_part} partial)")
 
     # --- Phase 2: Classify ---
-    endpoints = classify_endpoints(routes, all_paths, server_paths, schema_map)
+    endpoints = classify_endpoints(routes, spec_data, schema_map)
     total = len(endpoints)
-    c_true = sum(1 for e in endpoints if e["codified"] == "TRUE")
-    c_part = sum(1 for e in endpoints if e["codified"] == "Partial")
+
+    # Coverage breakdown
+    n_overlap = sum(1 for e in endpoints if e["coverage"] == "Overlap")
+    n_srv_under = sum(1 for e in endpoints if e["coverage"] == "Server Underlap")
+    n_sch_under = sum(1 for e in endpoints if e["coverage"] == "Schema Underlap")
+
+    # Status breakdown
+    n_active = sum(1 for e in endpoints if e["status"] == "Active")
+    n_deprecated = sum(1 for e in endpoints if e["status"] == "Deprecated")
+    n_unimpl = sum(1 for e in endpoints if e["status"] == "Unimplemented")
+    n_cloud = sum(1 for e in endpoints if e["status"] == "Cloud-only")
+
+    # Schema-Backed
+    b_true = sum(1 for e in endpoints if e["backed"] == "TRUE")
+
+    # Completeness
+    comp_full = sum(1 for e in endpoints if e["completeness"] == "Full")
+    comp_part = sum(1 for e in endpoints if e["completeness"] == "Partial")
+    comp_stub = sum(1 for e in endpoints if e["completeness"] == "Stub")
+
+    # Schema-Driven
     d_true = sum(1 for e in endpoints if e["driven"] == "TRUE")
     d_part = sum(1 for e in endpoints if e["driven"] == "Partial")
 
     print(f"\nClassified {total} endpoints:")
-    print(f"  Codified:  {c_true} TRUE, {c_part} Partial, {total - c_true - c_part} FALSE")
-    print(f"  Driven:    {d_true} TRUE, {d_part} Partial, {total - d_true - d_part} FALSE")
+    print(f"  Coverage:      {n_overlap} Overlap, {n_srv_under} Server Underlap, {n_sch_under} Schema Underlap")
+    print(f"  Status:        {n_active} Active, {n_deprecated} Deprecated, {n_unimpl} Unimplemented, {n_cloud} Cloud-only")
+    print(f"  Backed:        {b_true} TRUE, {total - b_true} FALSE")
+    print(f"  Completeness:  {comp_full} Full, {comp_part} Partial, {comp_stub} Stub")
+    print(f"  Driven:        {d_true} TRUE, {d_part} Partial")
 
     if args.verbose:
         print()
         for ep in endpoints:
             print(
                 f"  {ep['path']:55s} [{ep['methods']:20s}] "
-                f"cod={ep['codified']:7s} drv={ep['driven']:7s}"
+                f"cov={ep['coverage']:16s} st={ep['status']:14s} "
+                f"bk={ep['backed']:5s} comp={ep['completeness']:7s} "
+                f"drv={ep['driven']:7s}"
             )
 
     # --- Phase 3: Update sheet ---
