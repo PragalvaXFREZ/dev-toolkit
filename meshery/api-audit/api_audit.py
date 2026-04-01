@@ -24,13 +24,39 @@ Usage:
   python api_audit.py --repo /path/to/meshery --dry-run
 """
 
+# =====================================================================
+# USER CONFIGURATION — edit these variables to match your environment
+# =====================================================================
+
+# Google Sheet ID to write audit results to.
+# Find this in the sheet URL: https://docs.google.com/spreadsheets/d/<SHEET_ID>/edit
+SHEET_ID = ""
+
+# Absolute path to the meshery/meshery repository root.
+# Leave empty to use the current working directory.
+MESHERY_REPO_PATH = ""
+
+# Path to Google service-account credentials JSON file (for local development).
+# See: https://cloud.google.com/iam/docs/keys-create-delete
+GOOGLE_APPLICATION_CREDENTIALS = ""
+
+# Inline Google credentials JSON string (for CI / GitHub Actions).
+# If set, this takes priority over GOOGLE_APPLICATION_CREDENTIALS.
+GOOGLE_CREDENTIALS_JSON = ""
+
+# Optional: path to an OpenAPI spec file (e.g. merged_openapi.yml from
+# meshery/schemas). When set, overrides docs/data/openapi.yml in the repo.
+OPENAPI_SPEC_PATH = ""
+
+# =====================================================================
+
 import argparse
 import json
 import os
 import re
 import sys
 from collections import defaultdict
-from datetime import date
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -40,42 +66,6 @@ except ImportError:
     sys.exit("Missing dependency: pip install pyyaml")
 
 
-def load_local_env() -> None:
-    """Load simple KEY=VALUE pairs from .env into os.environ."""
-    seen: Set[Path] = set()
-    candidates = [
-        Path.cwd() / ".env",
-        Path(__file__).resolve().parent / ".env",
-    ]
-
-    for env_file in candidates:
-        env_file = env_file.resolve()
-        if env_file in seen or not env_file.exists():
-            continue
-        seen.add(env_file)
-
-        for raw_line in env_file.read_text(errors="replace").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("export "):
-                line = line[len("export "):].strip()
-            if "=" not in line:
-                continue
-
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip()
-            if not key:
-                continue
-
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-                value = value[1:-1]
-
-            os.environ.setdefault(key, value)
-
-
-load_local_env()
 
 # ---------------------------------------------------------------------------
 # Paths relative to repo root
@@ -348,61 +338,155 @@ def _get_content_schema(content: Any) -> Optional[dict]:
     return None
 
 
+def _describe_schema(schema: Optional[dict], label: str) -> List[str]:
+    """Return human-readable findings about a schema object."""
+    if not schema or not isinstance(schema, dict):
+        return [f"{label}: no schema defined"]
+
+    if "$ref" in schema:
+        ref = schema["$ref"].rsplit("/", 1)[-1]
+        return [f"{label}: references {ref}"]
+
+    if any(k in schema for k in ("allOf", "oneOf", "anyOf")):
+        combo = next(k for k in ("allOf", "oneOf", "anyOf") if k in schema)
+        count = len(schema[combo]) if isinstance(schema[combo], list) else "?"
+        return [f"{label}: {combo} with {count} sub-schemas"]
+
+    s_type = schema.get("type", "untyped")
+
+    if s_type == "array":
+        items = schema.get("items", {})
+        if isinstance(items, dict) and "$ref" in items:
+            ref = items["$ref"].rsplit("/", 1)[-1]
+            return [f"{label}: array of {ref}"]
+        return [f"{label}: array (inline items)"]
+
+    if s_type == "object":
+        props = schema.get("properties", {})
+        required = schema.get("required", [])
+        if not props:
+            return [f"{label}: object with no properties defined"]
+        prop_names = sorted(props.keys())
+        n = len(prop_names)
+        preview = ", ".join(prop_names[:6])
+        if n > 6:
+            preview += f", ... ({n} total)"
+        missing_desc = [
+            k for k, v in props.items()
+            if isinstance(v, dict) and not v.get("description")
+        ]
+        findings = [f"{label}: object with properties [{preview}]"]
+        if not required:
+            findings.append(f"{label}: no 'required' fields specified")
+        if missing_desc:
+            names = ", ".join(missing_desc[:5])
+            if len(missing_desc) > 5:
+                names += f", ... ({len(missing_desc)} total)"
+            findings.append(
+                f"{label}: properties missing description: {names}"
+            )
+        return findings
+
+    # bare type (string, integer, boolean, etc.) with no structure
+    return [f"{label}: bare type '{s_type}' with no properties or $ref"]
+
+
 def _assess_completeness(operation: dict, method: str) -> Tuple[str, List[str]]:
     """Assess schema completeness for a single OpenAPI operation.
 
-    Returns (completeness, detail_notes).
+    Returns (completeness, detail_notes) where detail_notes lists every
+    specific finding (missing fields, bare types, property gaps, etc.).
     """
     notes: List[str] = []
     expects_body = method.upper() in BODY_METHODS
 
+    # --- Operation-level checks ---
+    if not operation.get("operationId"):
+        notes.append("missing operationId")
+    if not operation.get("summary") and not operation.get("description"):
+        notes.append("missing summary/description")
+
+    # Parameters
+    params = operation.get("parameters", [])
+    if isinstance(params, list):
+        no_desc = [
+            p.get("name", "?") for p in params
+            if isinstance(p, dict) and not p.get("description")
+        ]
+        if no_desc:
+            notes.append(
+                f"parameters missing description: {', '.join(no_desc[:5])}"
+            )
+
     # --- Request side ---
     request_meaningful = False
     req_body = operation.get("requestBody", {})
-    if isinstance(req_body, dict):
+    if isinstance(req_body, dict) and req_body:
         if "$ref" in req_body:
             request_meaningful = True
+            ref = req_body["$ref"].rsplit("/", 1)[-1]
+            notes.append(f"requestBody: references {ref}")
         else:
-            req_schema = _get_content_schema(req_body.get("content", {}))
+            req_content = req_body.get("content", {})
+            req_schema = _get_content_schema(req_content)
             request_meaningful = _has_meaningful_schema(req_schema)
+            notes.extend(_describe_schema(req_schema, "requestBody"))
+    elif expects_body:
+        notes.append("requestBody: not defined (method expects a body)")
 
     # --- Response side ---
     response_meaningful = False
     responses = operation.get("responses", {})
+    defined_codes: Set[str] = set()
+
     if isinstance(responses, dict):
         for code, resp in responses.items():
-            if not str(code).startswith("2") or not isinstance(resp, dict):
+            defined_codes.add(str(code))
+            if not isinstance(resp, dict):
                 continue
-            if "$ref" in resp:
-                response_meaningful = True
-                break
-            resp_schema = _get_content_schema(resp.get("content", {}))
-            if _has_meaningful_schema(resp_schema):
-                response_meaningful = True
-                break
+
+            if str(code).startswith("2"):
+                if "$ref" in resp:
+                    response_meaningful = True
+                    ref = resp["$ref"].rsplit("/", 1)[-1]
+                    notes.append(f"response {code}: references {ref}")
+                else:
+                    resp_content = resp.get("content", {})
+                    resp_schema = _get_content_schema(resp_content)
+                    if _has_meaningful_schema(resp_schema):
+                        response_meaningful = True
+                    notes.extend(
+                        _describe_schema(resp_schema, f"response {code}")
+                    )
+
+    if not any(str(c).startswith("2") for c in defined_codes):
+        notes.append("no 2xx success response defined")
+
+    # Missing common error responses
+    common_errors = {"400", "401", "404", "500"}
+    missing_errors = sorted(common_errors - defined_codes)
+    if missing_errors:
+        notes.append(f"missing error responses: {', '.join(missing_errors)}")
 
     # --- Classify ---
     if expects_body:
         if request_meaningful and response_meaningful:
             return "Full", notes
         if request_meaningful or response_meaningful:
-            if not request_meaningful:
-                notes.append("spec missing requestBody schema")
-            if not response_meaningful:
-                notes.append("spec missing response schema")
             return "Partial", notes
-        notes.append("spec entry has no request/response schemas")
         return "Stub", notes
     else:
         # GET, DELETE, HEAD, OPTIONS — only response matters
         if response_meaningful:
             return "Full", notes
-        notes.append("spec entry has no response schema")
         return "Stub", notes
 
 
-def parse_openapi(repo: Path) -> dict:
-    """Parse openapi.yml and return structured data for all columns.
+def parse_openapi(repo: Path, spec_override: Optional[Path] = None) -> dict:
+    """Parse an OpenAPI spec and return structured data for all columns.
+
+    When *spec_override* is given it is used directly; otherwise the script
+    falls back to ``docs/data/openapi.yml`` inside *repo*.
 
     Returns a dict with:
       all_paths:      {norm_path: {METHOD, ...}}
@@ -411,7 +495,7 @@ def parse_openapi(repo: Path) -> dict:
       original_paths: {norm_path: original_path}
       compl_notes:    {(norm_path, METHOD): [detail_notes]}
     """
-    spec_file = repo / OPENAPI_FILE
+    spec_file = spec_override if spec_override else repo / OPENAPI_FILE
     empty = {
         "all_paths": {},
         "completeness": {},
@@ -628,7 +712,67 @@ def build_schema_driven_map(repo: Path) -> Dict[str, Tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# 4. Classification — bidirectional walk (Router ∪ Spec)
+# 4. Actionable Notes Builder
+# ---------------------------------------------------------------------------
+
+def _build_actionable_notes(
+    *,
+    coverage: str,
+    status: str,
+    is_commented: bool,
+    completeness: str,
+    compl_notes: List[str],
+    driven: str,
+    handler: str,
+    cloud_methods: List[str],
+    spec_methods: Set[str],
+) -> str:
+    """Build a detailed, actionable summary for the Notes column.
+
+    Includes high-level action items plus specific findings from the
+    completeness assessment (missing fields, bare types, property gaps, etc.).
+    """
+    parts: List[str] = []
+
+    # --- Status-level action ---
+    if is_commented:
+        parts.append("Route commented out — consider removal from router and spec")
+
+    if coverage == "Server Underlap":
+        parts.append("Not in OpenAPI spec — add spec definition")
+    elif coverage == "Schema Underlap":
+        if status == "Cloud-only":
+            parts.append("Cloud-only (x-internal) — no OSS route required")
+        elif status == "Unimplemented":
+            parts.append("In spec but no server route — implement handler or remove from spec")
+
+    # --- Cloud backward compat (Overlap case) ---
+    if coverage == "Overlap" and cloud_methods:
+        if len(cloud_methods) == len(spec_methods):
+            parts.append("Marked as cloud in schema (x-internal), equivalent route exists in server")
+        else:
+            parts.append(
+                f"Partially marked as cloud in schema ({', '.join(cloud_methods)} are x-internal: cloud), equivalent route exists in server"
+            )
+
+    # --- Detailed spec completeness findings ---
+    if compl_notes:
+        parts.extend(compl_notes)
+
+    # --- Schema-driven ---
+    if driven == "FALSE" and coverage != "Schema Underlap":
+        if handler in ("<inline>", "<unknown>"):
+            parts.append(f"Handler is {handler} — extract to named function and adopt schema types")
+        else:
+            parts.append("Handler not using meshery/schemas types — migrate to schema-driven")
+    elif driven == "Partial":
+        parts.append("Uses only core schema types — adopt versioned model types (v1beta1, etc.)")
+
+    return "; ".join(parts) if parts else ""
+
+
+# ---------------------------------------------------------------------------
+# 5. Classification — bidirectional walk (Router ∪ Spec)
 # ---------------------------------------------------------------------------
 
 def _aggregate_completeness(
@@ -710,8 +854,26 @@ def classify_endpoints(
         # --- Coverage ---
         coverage = "Overlap" if spec_methods else "Server Underlap"
 
+        # --- Cloud methods (needed for Status and Notes) ---
+        cloud_methods: List[str] = []
+        if coverage != "Server Underlap":
+            check_m = (
+                sorted(spec_methods)
+                if methods == ["ALL"]
+                else [m for m in methods if m in spec_methods]
+            )
+            for m in check_m:
+                xi = x_internal_map.get((norm, m), [])
+                if "cloud" in xi:
+                    cloud_methods.append(m)
+
         # --- Status ---
-        status = "Deprecated" if is_commented else "Active"
+        if is_commented:
+            status = "Deprecated"
+        elif cloud_methods and len(cloud_methods) == len(spec_methods):
+            status = "Active (Cloud-annotated)"
+        else:
+            status = "Active"
 
         # --- Schema-Backed ---
         backed = "TRUE" if spec_methods else "FALSE"
@@ -728,25 +890,18 @@ def classify_endpoints(
                 handler, ("FALSE", "handler not mapped")
             )
 
-        # --- Notes ---
-        notes: List[str] = []
-        if is_commented:
-            notes.append("commented out in server.go")
-        if coverage == "Server Underlap":
-            notes.append("no path in OpenAPI spec")
-        else:
-            # Check if any matched method is cloud-only
-            cloud_methods = []
-            for m in (spec_methods if methods == ["ALL"] else methods):
-                xi = x_internal_map.get((norm, m), [])
-                if "cloud" in xi:
-                    cloud_methods.append(m)
-            if cloud_methods and len(cloud_methods) == len(spec_methods):
-                notes.append("spec marked cloud-only (x-internal)")
-        if compl_notes:
-            notes.extend(compl_notes)
-        if driven_reason:
-            notes.append(driven_reason)
+        # --- Notes (actionable summary) ---
+        notes = _build_actionable_notes(
+            coverage=coverage,
+            status=status,
+            is_commented=is_commented,
+            completeness=completeness,
+            compl_notes=compl_notes,
+            driven=driven,
+            handler=handler,
+            cloud_methods=cloud_methods,
+            spec_methods=spec_methods,
+        )
 
         endpoints.append({
             "category": category,
@@ -758,7 +913,7 @@ def classify_endpoints(
             "backed": backed,
             "completeness": completeness,
             "driven": driven,
-            "notes": "; ".join(notes),
+            "notes": notes,
         })
 
     # ------------------------------------------------------------------
@@ -802,17 +957,22 @@ def classify_endpoints(
         # --- Schema-Driven ---
         driven = "N/A"
 
-        # --- Notes ---
-        notes: List[str] = []
-        if status == "Cloud-only":
-            notes.append("defined in spec; cloud-only (x-internal)")
-        elif any_cloud:
-            notes.append("defined in spec; partially cloud-only (x-internal)")
-        else:
-            notes.append("defined in spec; no server route")
-        if compl_notes:
-            notes.extend(compl_notes)
-        notes.append("no handler (schema-only endpoint)")
+        # --- Notes (actionable summary) ---
+        cloud_methods_list = [
+            m for m in methods_sorted
+            if "cloud" in x_internal_map.get((norm_path, m), [])
+        ]
+        notes = _build_actionable_notes(
+            coverage=coverage,
+            status=status,
+            is_commented=False,
+            completeness=completeness,
+            compl_notes=compl_notes,
+            driven=driven,
+            handler="",
+            cloud_methods=cloud_methods_list,
+            spec_methods=set(methods_sorted),
+        )
 
         endpoints.append({
             "category": category,
@@ -824,7 +984,7 @@ def classify_endpoints(
             "backed": backed,
             "completeness": completeness,
             "driven": driven,
-            "notes": "; ".join(notes),
+            "notes": notes,
         })
 
     return sorted(endpoints, key=endpoint_sort_key)
@@ -849,15 +1009,15 @@ def _get_sheet_client():
         "https://www.googleapis.com/auth/drive",
     ]
 
-    # Option 1: inline JSON (GitHub Actions secrets)
-    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    # Option 1: inline JSON (config variable or env var, for CI / GitHub Actions)
+    creds_json = GOOGLE_CREDENTIALS_JSON or os.environ.get("GOOGLE_CREDENTIALS_JSON")
     if creds_json:
         info = json.loads(creds_json)
         creds = Credentials.from_service_account_info(info, scopes=scopes)
         return gspread.authorize(creds)
 
-    # Option 2: file path (local development)
-    creds_file = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    # Option 2: file path (config variable or env var, for local development)
+    creds_file = GOOGLE_APPLICATION_CREDENTIALS or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if creds_file and os.path.exists(creds_file):
         creds = Credentials.from_service_account_file(creds_file, scopes=scopes)
         return gspread.authorize(creds)
@@ -940,7 +1100,7 @@ def update_sheet(
     batch_updates: List[Dict[str, Any]] = []
     new_rows_info: List[Tuple[List[str], str, str]] = []
     matched_rows: Set[int] = set()
-    today = date.today().isoformat()
+    today = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     for ep in endpoints:
         norm = normalize_path(ep["path"])
@@ -1126,16 +1286,25 @@ def main():
     )
     parser.add_argument(
         "--repo",
-        default=os.environ.get("MESHERY_REPO_PATH", "."),
+        default=MESHERY_REPO_PATH or os.environ.get("MESHERY_REPO_PATH", "."),
         help=(
             "Path to the meshery/meshery repo root "
-            "(default: cwd or $MESHERY_REPO_PATH)"
+            "(default: MESHERY_REPO_PATH config at top of file, "
+            "or $MESHERY_REPO_PATH env var, or cwd)"
+        ),
+    )
+    parser.add_argument(
+        "--spec",
+        default=OPENAPI_SPEC_PATH or os.environ.get("OPENAPI_SPEC_PATH"),
+        help=(
+            "Path to an OpenAPI spec file (e.g. merged_openapi.yml from "
+            "meshery/schemas). Overrides docs/data/openapi.yml in the repo."
         ),
     )
     parser.add_argument(
         "--sheet-id",
-        default=os.environ.get("SHEET_ID"),
-        help="Google Sheet ID (or set $SHEET_ID env var)",
+        default=SHEET_ID or os.environ.get("SHEET_ID"),
+        help="Google Sheet ID (default: SHEET_ID config at top of file, or $SHEET_ID env var)",
     )
     parser.add_argument(
         "--dry-run",
@@ -1164,8 +1333,10 @@ def main():
     routes = parse_router(repo)
     print(f"  {len(routes)} route registrations")
 
-    print("Parsing OpenAPI spec...")
-    spec_data = parse_openapi(repo)
+    spec_override = Path(args.spec).resolve() if args.spec else None
+    spec_label = spec_override or (repo / OPENAPI_FILE)
+    print(f"Parsing OpenAPI spec ({spec_label})...")
+    spec_data = parse_openapi(repo, spec_override=spec_override)
     n_spec = len(spec_data["all_paths"])
     print(f"  {n_spec} spec paths")
 
@@ -1186,6 +1357,7 @@ def main():
 
     # Status breakdown
     n_active = sum(1 for e in endpoints if e["status"] == "Active")
+    n_cloud_compat = sum(1 for e in endpoints if e["status"] == "Active (Cloud-annotated)")
     n_deprecated = sum(1 for e in endpoints if e["status"] == "Deprecated")
     n_unimpl = sum(1 for e in endpoints if e["status"] == "Unimplemented")
     n_cloud = sum(1 for e in endpoints if e["status"] == "Cloud-only")
@@ -1204,7 +1376,7 @@ def main():
 
     print(f"\nClassified {total} endpoints:")
     print(f"  Coverage:      {n_overlap} Overlap, {n_srv_under} Server Underlap, {n_sch_under} Schema Underlap")
-    print(f"  Status:        {n_active} Active, {n_deprecated} Deprecated, {n_unimpl} Unimplemented, {n_cloud} Cloud-only")
+    print(f"  Status:        {n_active} Active, {n_cloud_compat} Active (Cloud-annotated), {n_deprecated} Deprecated, {n_unimpl} Unimplemented, {n_cloud} Cloud-only")
     print(f"  Backed:        {b_true} TRUE, {total - b_true} FALSE")
     print(f"  Completeness:  {comp_full} Full, {comp_part} Partial, {comp_stub} Stub")
     print(f"  Driven:        {d_true} TRUE, {d_part} Partial")
