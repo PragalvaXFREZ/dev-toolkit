@@ -1,5 +1,7 @@
 # Meshery API Endpoint Audit
 
+_An improved version of this tooling has been merged to [github.com/meshery/schemas](https://github.com/meshery/schemas), PR: https://github.com/meshery/schemas/pull/749_
+
 This project audits Meshery API endpoints across the Meshery server and Meshery Cloud codebases. It combines a Python reporting pipeline with a Go AST analyzer to compare registered routes, OpenAPI coverage, schema completeness, and whether handlers are actually using `meshery/schemas` types.
 
 The goal is to make API schema adoption measurable instead of anecdotal. The script produces a terminal summary for local review and can optionally sync the results to a Google Sheet used for ongoing verification.
